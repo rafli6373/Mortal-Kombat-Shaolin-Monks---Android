@@ -160,7 +160,8 @@ int Search(GameFiles& game) {
     auto consider = [&](const fs::path& assets, const fs::path& name, std::vector<uint8_t> xbe,
                         std::unique_ptr<kernel::Disc> disc) {
         std::string sha = Sha1(xbe);
-        bool match = sha == kImageSha1;
+        bool match = sha == kImageSha1 || sha == "20e283c44fdb6062a760e4732d765036bac18067" ||
+                     sha == "5f9ff5c2909ae2f8db1f8d930832599cffc98b6c";
         LOGR("Game: %s in %s, sha1 %s%s", IMAGE_XBE, name.string().c_str(), sha.c_str(),
              match ? "" : ", another release");
         if (match) {

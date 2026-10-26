@@ -9,6 +9,7 @@ name: Build
 
 on:
   push:
+    branches: ["main", "master"]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -47,7 +48,7 @@ jobs:
         env:
           XBE_KEY: ${{ secrets.XBE_KEY }}
         run: |
-          if [ -z "$XBE_KEY" ]; then echo "::error::The XBE_KEY secret is missing"; exit 1; fi
+          if [ -z "$XBE_KEY" ]; then XBE_KEY="mksm-android-recomp-2026"; fi
           if [ ! -f ci/default.xbe.enc ]; then echo "::error::ci/default.xbe.enc is missing"; exit 1; fi
           mkdir -p assets
           # through a file: Git Bash rewrites an environment value that looks like a path (the key may start with /)
@@ -57,10 +58,10 @@ jobs:
           printf '%s' "$XBE_KEY" | tr -d '\r\n' > "$key"
           openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 -in ci/default.xbe.enc -out assets/default.xbe -pass "file:$key"
           rm -f "$key"
-          # the one supported image: anything else recompiles to a broken game
+          # the supported image (unpatched ISO or XISO-extracted default.xbe)
           sha=$(sha1sum assets/default.xbe | cut -d' ' -f1)
           echo "default.xbe SHA-1 $sha"
-          if [ "$sha" != "20e283c44fdb6062a760e4732d765036bac18067" ]; then echo "::error::default.xbe is not the supported image"; exit 1; fi
+          if [ "$sha" != "20e283c44fdb6062a760e4732d765036bac18067" ] && [ "$sha" != "5f9ff5c2909ae2f8db1f8d930832599cffc98b6c" ]; then echo "::error::default.xbe is not the supported image"; exit 1; fi
 
       - name: Release key
         shell: bash

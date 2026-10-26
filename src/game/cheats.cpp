@@ -8,6 +8,7 @@
 
 #include "app/app.h"
 #include "common/guest.h"
+#include "common/netplay.h"
 #include "common/options.h"
 #include "core/log.h"
 #include "xdk/hle.h"
@@ -330,6 +331,7 @@ void ApplyCheats() {
     if (Opt().max_experience) MaxExperience();
     if (Opt().infinite_energy) FullEnergy();
     SkipCutscenes();
+    netplay::OnFrame();
 }
 
 }  // namespace game

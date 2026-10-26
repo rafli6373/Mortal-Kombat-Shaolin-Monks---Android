@@ -4,6 +4,7 @@
 #include "audio/output.h"
 #include "common/menu.h"
 #include "common/mouse_keyboard.h"
+#include "common/netplay.h"
 #include "common/options.h"
 #include "common/pad_binds.h"
 
@@ -15,12 +16,18 @@ namespace {
 void Pad(int port, input::Pad& pad) {
     input::SeenPad(pad);
     if (port == 0) pad.connected = true;
-    if (app::MenuOpen()) pad = input::Pad{.connected = pad.connected};
-    else if (port == 0) input::Keyboard(pad);
+    if (app::MenuOpen()) {
+        bool conn = pad.connected || (port == 1 && netplay::GetMode() != netplay::kOff);
+        pad = input::Pad{.connected = conn};
+        return;
+    }
+    if (port == 0) input::Keyboard(pad);
+    netplay::FilterPad(port, pad);
 }
 
 // no vibration while the keyboard and mouse are in use
 void Rumble(int port, uint16_t& left, uint16_t& right) {
+    netplay::FilterRumble(port, left, right);
     if (port != 0 || !input::KeyboardActive()) return;
     left = 0;
     right = 0;
@@ -35,6 +42,8 @@ void Load(const void* table) {
     o.touch_sensitivity = float(t["touch_sensitivity"].value_or(double(o.mouse_sensitivity)));
     std::string language = t["language"].value_or(o.language);
     if (KnownLanguage(language)) o.language = language;
+    netplay::SetSyncEnabled(t["netplay_sync"].value_or(true));
+    netplay::SetTargetHostOctet(uint32_t(t["netplay_host_octet"].value_or(int64_t(0))));
     if (const toml::table* keys = t["keys"].as_table())
         for (auto&& [id, value] : *keys)
             if (auto v = value.value<std::string>()) o.keys[std::string(id.str())] = *v;
@@ -49,6 +58,7 @@ void Init() {
     input::LoadBindings();
     input::LoadPadBindings();
     audio::SetOutputMode(Opt().audio_output);
+    netplay::Init();
 }
 
 void Save(void* table) {
@@ -57,6 +67,8 @@ void Save(void* table) {
     t.insert("mouse_sensitivity", double(o.mouse_sensitivity));
     t.insert("touch_sensitivity", double(o.touch_sensitivity));
     t.insert("language", o.language);
+    t.insert("netplay_sync", netplay::SyncEnabled());
+    t.insert("netplay_host_octet", int64_t(netplay::TargetHostOctet()));
     toml::table keys;
     for (const auto& [id, value] : o.keys) keys.insert(id, value);
     t.insert("keys", keys);

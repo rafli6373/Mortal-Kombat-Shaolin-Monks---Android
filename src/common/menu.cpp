@@ -22,6 +22,7 @@
 #include "common/keys.h"
 #include "common/menu.h"
 #include "common/mouse_keyboard.h"
+#include "common/netplay.h"
 #include "common/options.h"
 #include "common/pad_binds.h"
 #include "common/translations.h"
@@ -253,7 +254,7 @@ enum RowId { kRenderResolution, kMaxFps, kVsync, kFpsCounter, kAniso, kReloadBlu
              kCheckUpdates, kTouchSensitivity, kUnlockCharacters, kPs2Buttons,
              kUnlockExtras, kInfiniteFatality, kMaxExperience, kMaxHealth, kMaxMana, kAspectRatio, kSkipCutscenes, kScreenFilter, kAntiAliasing,
              kFrameSkip, kFpsPosition, kFpsTemps, kUltrawide, kStickMode, kBloom, kFog, kInfiniteEnergy, kDonate,
-             kGithub, kYoutube, kFpsUsage };
+             kGithub, kYoutube, kFpsUsage, kNetplayMode, kNetplaySync, kNetplayTargetIp, kNetplayLocalIp, kNetplayStatus };
 
 using rows::Kind;
 using rows::Row;
@@ -294,6 +295,12 @@ constexpr Row kTouchRows[] = {
 constexpr Row kGeneralRows[] = {
     {Kind::Value, kLanguage, "LANGUAGE"},
     {Kind::Value, kAudioOutput, "AUDIO OUTPUT"},
+    {Kind::Heading, -1, "MULTIPLAYER (WIFI / HOTSPOT)"},
+    {Kind::Value, kNetplayMode, "MULTIPLAYER MODE"},
+    {Kind::Value, kNetplaySync, "POSITION & STATE SYNC"},
+    {Kind::Value, kNetplayTargetIp, "HOST IP (FOR P2)"},
+    {Kind::Info, kNetplayLocalIp, "LOCAL IP"},
+    {Kind::Info, kNetplayStatus, "CONNECTION STATUS"},
     {Kind::Heading, -1, "CHEATS"},
     {Kind::Value, kUnlockCharacters, "UNLOCK ALL CHARACTERS"},
     {Kind::Value, kUnlockExtras, "UNLOCK ALL KONTENT"},
@@ -573,6 +580,18 @@ void StepInputRow(int id, int step, char (&text)[64]) {
             std::snprintf(text, sizeof(text), format, kLanguageNames[i]);
             break;
         }
+        case kNetplayMode:
+            if (step) netplay::StepMode(step);
+            std::snprintf(text, sizeof(text), "%s", netplay::ModeName());
+            break;
+        case kNetplaySync:
+            if (step) netplay::SetSyncEnabled(!netplay::SyncEnabled());
+            std::snprintf(text, sizeof(text), "%s", OnOff(netplay::SyncEnabled()));
+            break;
+        case kNetplayTargetIp:
+            if (step) netplay::StepTargetHostOctet(step);
+            std::snprintf(text, sizeof(text), "%s", netplay::TargetHostText().c_str());
+            break;
     }
 }
 
@@ -796,8 +815,18 @@ void LinkRow(const Row& r) {
 void InfoRow(const Row& r) {
     RowBox box = MeasureRow();
     RowLabel(box, r.label);
+    std::string dynamic_val;
+    const char* name = nullptr;
     if (r.id >= 0 && r.id < int(std::size(kCreditNames))) {
-        const char* name = kCreditNames[r.id];
+        name = kCreditNames[r.id];
+    } else if (r.id == kNetplayLocalIp) {
+        dynamic_val = netplay::LocalIpText();
+        name = dynamic_val.c_str();
+    } else if (r.id == kNetplayStatus) {
+        dynamic_val = Ui(netplay::StatusText());
+        name = dynamic_val.c_str();
+    }
+    if (name) {
         float x = box.row_x + box.row_w - ImGui::CalcTextSize(name).x - ImGui::GetStyle().ItemInnerSpacing.x;
         ImGui::SetCursorPos(ImVec2(x, box.row_y));
         ImGui::AlignTextToFramePadding();

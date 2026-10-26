@@ -191,6 +191,22 @@ constexpr Entry kEntries[] = {
     {"SHOW", {{}, {}, {}, {}, u"Tampilkan"}},
     {"DONE", {{}, {}, {}, {}, u"Selesai"}},
     {"DRAG A CONTROL TO MOVE IT", {{}, {}, {}, {}, u"Seret kontrol untuk memindahkannya"}},
+
+    // Local Wi-Fi / Hotspot Multiplayer
+    {"MULTIPLAYER (WIFI / HOTSPOT)", {u"Multijoueur (Wi-Fi / Hotspot)", u"Mehrspieler (WLAN / Hotspot)", u"Multigiocatore (Wi-Fi / Hotspot)", u"Multijugador (Wi-Fi / Hotspot)", u"Multiplayer (Wi-Fi / Hotspot)"}},
+    {"MULTIPLAYER MODE", {u"Mode multijoueur", u"Mehrspielermodus", u"Modalità multigiocatore", u"Modo multijugador", u"Mode multiplayer"}},
+    {"POSITION & STATE SYNC", {u"Synchro position et état", u"Positions- & Status-Sync", u"Sincronia posizione e stato", u"Sincronización de posición", u"Sinkronisasi posisi & status"}},
+    {"HOST IP (FOR P2)", {u"IP hôte (pour J2)", u"Host-IP (für S2)", u"IP host (per G2)", u"IP del host (para J2)", u"IP Host (untuk P2)"}},
+    {"LOCAL IP", {u"IP locale", u"Lokale IP", u"IP locale", u"IP local", u"IP lokal HP ini"}},
+    {"CONNECTION STATUS", {u"État de la connexion", u"Verbindungsstatus", u"Stato connessione", u"Estado de conexión", u"Status koneksi"}},
+    {"OFF (SOLO)", {u"Désactivé (Solo)", u"Aus (Solo)", u"Disattivato (Solo)", u"Desactivado (Solo)", u"Mati (Solo)"}},
+    {"HOST (PLAYER 1)", {u"Hôte (Joueur 1)", u"Host (Spieler 1)", u"Host (Giocatore 1)", u"Host (Jugador 1)", u"Host (Pemain 1)"}},
+    {"JOIN (PLAYER 2)", {u"Rejoindre (Joueur 2)", u"Beitreten (Spieler 2)", u"Unisciti (Giocatore 2)", u"Unirse (Jugador 2)", u"Gabung (Pemain 2)"}},
+    {"AUTO (HOTSPOT / WIFI)", {u"Auto (Hotspot / Wi-Fi)", u"Auto (Hotspot / WLAN)", u"Auto (Hotspot / Wi-Fi)", u"Auto (Hotspot / Wi-Fi)", u"Otomatis (Hotspot / Wi-Fi)"}},
+    {"OFFLINE", {u"Hors ligne", u"Offline", u"Offline", u"Sin conexión", u"Offline"}},
+    {"WAITING FOR P2...", {u"En attente du J2...", u"Warte auf S2...", u"In attesa di G2...", u"Esperando al J2...", u"Menunggu Pemain 2..."}},
+    {"SEARCHING HOST...", {u"Recherche de l'hôte...", u"Suche Host...", u"Ricerca host...", u"Buscando host...", u"Mencari Host..."}},
+    {"CONNECTED", {u"Connecté", u"Verbunden", u"Connesso", u"Conectado", u"Terhubung"}},
 };
 
 bool Same(std::string_view a, std::string_view b) {
