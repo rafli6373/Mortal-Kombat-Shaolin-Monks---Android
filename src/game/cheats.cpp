@@ -209,25 +209,17 @@ void FullHealth() {
 
 // The mana of player n (1 or 2), the fatality meter drawn as the blue bar: a level's top is a third of the character's
 // most, at [info + 4] (AddFatality, 0x084980, caps it at both), so three levels is the longest bar. Longest sets the
-// level to three, full fills it to the level's top
+// level to three, full fills it to the level's top.
+// GetFatalityUnit (0x082EA0) and GetFilledFatalityLevels (0x082F00) multiply `most` by [0x49F0F4] = 0x3EAAAAAB
+// (0.3333333432674408f, rounded UP in IEEE-754 float), so `most / 3.0f` is 1 ULP below 1 unit (`0x42055555` vs
+// `0x42055556`) and `most` is 1 ULP below 3 units (`0x42C80000` vs `0x42C80001`). Computing `unit` with `kFatalityThird`
+// plus a small margin ensures 0x082F00, 0x03D09A, and 0x03D1FF always recognize all filled Fatality/Multality/Brutality
+// levels and never softlock the Goro's Lair Fatality tutorial (0x58A618 / 0x59D320).
 constexpr int32_t kManaLevels = 3;
+constexpr float kFatalityThird = 0.3333333432674408f;  // [0x49F0F4] = 0x3EAAAAAB
 void Mana(uint32_t n, bool longest, bool full) {
     uint32_t profile = Profile();
     uint32_t character = R32(kCharacterTable + (n * 3 + 3) * 4);
-    {  // DIAG
-        static int64_t logged[3] = {};
-        if (NowMs() - logged[n] > 3000) {
-            logged[n] = NowMs();
-            uint32_t rec = GuestMapped(character) ? R32(character + kRecordIndex) : 0xFFFFFFFF;
-            uint32_t info = GuestMapped(character) ? R32(character + kCharacterInfo) : 0;
-            uint32_t meter = GuestMapped(info) ? R32(info + kInfoMeter) : 0;
-            float most = GuestMapped(meter) ? G<float>(meter + kMeterMost) : -1;
-            uint32_t at = profile ? PlayerRecord(profile, rec < 3 ? rec : 0) : 0;
-            LOGI("mana diag n=%u profile=%08X char=%08X rec=%u info=%08X meter=%08X most=%g level=%d amount=%g", n,
-                 profile, character, rec, info, meter, most, at ? int32_t(R32(at + kFatalityLevel)) : -1,
-                 at ? G<float>(at + kFatality) : -1.0f);
-        }
-    }
     if (!profile || !GuestMapped(character)) return;
     uint32_t record = R32(character + kRecordIndex);
     if (record < 1 || record > 2) return;
@@ -238,10 +230,24 @@ void Mana(uint32_t n, bool longest, bool full) {
     float most = G<float>(meter + kMeterMost);
     if (!(most > 0 && most < 1000000)) return;
     uint32_t at = PlayerRecord(profile, record);
-    if (longest && int32_t(R32(at + kFatalityLevel)) < kManaLevels) W32(at + kFatalityLevel, kManaLevels);
+    bool in_tutorial = R32(0x58A618) != 0 || G<uint8_t>(0x59D320) != 0;
+    if (longest && !in_tutorial && int32_t(R32(at + kFatalityLevel)) < kManaLevels) W32(at + kFatalityLevel, kManaLevels);
     int32_t level = int32_t(R32(at + kFatalityLevel));
-    if (!full || level <= 0 || level > 100) return;
-    float top = std::min(float(level) * most / kManaLevels, most);
+    if (full && level <= 0 && in_tutorial) {
+        W32(at + kFatalityLevel, 1);
+        level = 1;
+    }
+    float unit = most * kFatalityThird;
+    if (!full) {
+        // Even with Infinite Mana off, ensure a nearly-full tutorial bar never falls 1 ULP short of `unit`
+        if (in_tutorial && G<float>(at + kFatality) >= most / kManaLevels && G<float>(at + kFatality) < unit + 0.001f) {
+            G<float>(at + kFatality) = unit + 0.001f;
+        }
+        return;
+    }
+    if (level <= 0 || level > 100) return;
+    float top = (level >= kManaLevels) ? (3.0f * unit) : (level == 2 ? (unit + unit) : unit);
+    top = std::max(top, std::min(float(level) * most / kManaLevels, most)) + 0.001f;
     if (G<float>(at + kFatality) < top) G<float>(at + kFatality) = top;
 }
 

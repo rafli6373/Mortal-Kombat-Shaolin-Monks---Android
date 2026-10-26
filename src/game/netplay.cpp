@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -102,6 +103,12 @@ struct HostSyncPacket {
     WirePad pad1;
     uint32_t body_count = 0;
     PlayerScalarState players[2];
+    struct PlayerExtraState {
+        float yaw = 0;
+        float target_yaw = 0;
+        float ground_y = 0;
+        uint8_t has_extra = 0;
+    } extra[2];
 };
 #pragma pack(pop)
 
@@ -190,15 +197,21 @@ constexpr uint32_t kFatalityLevelOffset = 0x38;
 
 constexpr uint32_t kPlayerRecordsBase = 0x5D1AB8;
 constexpr uint32_t kPlayerRecordStride = 0x3238;
-constexpr uint32_t kRecordPosOffset = 0x80;     // float x, y, z
-constexpr uint32_t kRecordVelOffset = 0xD0;     // float vx, vy, vz
-constexpr uint32_t kRecordBodyPtrOffset = 0x200; // 0x5D1CB8: pointer to player Body
+constexpr uint32_t kRecordInactiveOffset = 0x70;   // uint8_t: 0 when active in gameplay
+constexpr uint32_t kRecordPosOffset = 0x80;        // float x, y, z
+constexpr uint32_t kRecordYawOffset = 0x94;        // float yaw (radians)
+constexpr uint32_t kRecordPrevGroundOffset = 0xC0; // float prev_ground_y
+constexpr uint32_t kRecordCurGroundOffset = 0xC4;  // float cur_ground_y
+constexpr uint32_t kRecordVelOffset = 0xD0;        // float vx, vy, vz
+constexpr uint32_t kRecordGroundOffset = 0xF4;     // float ground_y
+constexpr uint32_t kRecordBodyPtrOffset = 0x200;   // 0x5D1CB8: pointer to player Body
+constexpr uint32_t kRecordTargetYawOffset = 0x3120;// float target_yaw (radians)
+constexpr uint32_t kRecordCachedPosOffset = 0x3164;// float cached_x, cached_y, cached_z
 
 constexpr uint32_t kPlayerObjectsTable[2] = {0x51005C, 0x510060};
 constexpr uint32_t kBodyCountAddr = 0x5142A4;
-constexpr uint32_t kBodyPosOffset = 0x30;       // float x, y, z inside Body
-constexpr uint32_t kBodyHealthOffset = 0x368;   // int32_t health
-constexpr uint32_t kBodyMaxHealthOffset = 0x370; // int32_t max_health
+constexpr uint32_t kBodyHealthOffset = 0x368;      // int32_t health
+constexpr uint32_t kBodyMaxHealthOffset = 0x370;   // int32_t max_health
 
 constexpr uint32_t kEnergyTable = 0x4E65A8;
 constexpr uint32_t kEnergyCount = 0x4E65E0;
@@ -231,6 +244,7 @@ HostSyncPacket g_host_cached_sync{};
 uint32_t g_last_host_frame_ms = 0;
 uint32_t g_last_host_send_ms = 0;
 bool g_has_sync = false;
+uint32_t g_last_sync_ms = 0;
 uint32_t g_last_applied_seq = 0;
 uint32_t g_tx_seq = 0;
 
@@ -427,7 +441,7 @@ void SendUdp(const void* data, size_t len, uint32_t dst_ip_net, uint16_t dst_por
 #endif
 }
 
-// Reads current player scalar state from guest memory (only called on the game thread during Present).
+// Reads current player scalar state from guest memory (only called on the game thread).
 void CaptureHostState(HostSyncPacket& pkt) {
     uint32_t sim = 0;
     if (SafeReadU32(kSimFrameCounter, sim)) pkt.hdr.sim_frame = sim;
@@ -443,10 +457,13 @@ void CaptureHostState(HostSyncPacket& pkt) {
 
     for (uint32_t p = 0; p < 2; p++) {
         PlayerScalarState& out = pkt.players[p];
+        auto& ext = pkt.extra[p];
         out.valid = 0;
+        ext.has_extra = 0;
 
         uint32_t rec_base = kPlayerRecordsBase + p * kPlayerRecordStride;
-        if (!SafeGuestRange(rec_base, 0x220)) continue;
+        if (!SafeGuestRange(rec_base, kPlayerRecordStride)) continue;
+        if (kernel::G<uint8_t>(rec_base + kRecordInactiveOffset) != 0) continue;
 
         uint32_t body_va = 0;
         if (!SafeReadU32(rec_base + kRecordBodyPtrOffset, body_va) || !body_va) {
@@ -456,10 +473,14 @@ void CaptureHostState(HostSyncPacket& pkt) {
 
         int32_t hp = 0, max_hp = 0;
         uint32_t hp_u = 0, max_hp_u = 0;
-        if (!SafeReadU32(body_va + kBodyHealthOffset, hp_u) || !SafeReadU32(body_va + kBodyMaxHealthOffset, max_hp_u)) continue;
-        hp = int32_t(hp_u);
-        max_hp = int32_t(max_hp_u);
-        if (max_hp <= 0 || max_hp > 100000 || hp < 0 || hp > 100000) continue;
+        if (SafeReadU32(body_va + kBodyHealthOffset, hp_u) && SafeReadU32(body_va + kBodyMaxHealthOffset, max_hp_u)) {
+            int32_t h = int32_t(hp_u);
+            int32_t mh = int32_t(max_hp_u);
+            if (mh > 0 && mh <= 100000 && h >= 0 && h <= 100000) {
+                hp = h;
+                max_hp = mh;
+            }
+        }
 
         float x = 0, y = 0, z = 0, vx = 0, vy = 0, vz = 0;
         if (!SafeReadFloat(rec_base + kRecordPosOffset + 0, x) ||
@@ -482,6 +503,16 @@ void CaptureHostState(HostSyncPacket& pkt) {
         out.health = hp;
         out.max_health = max_hp;
 
+        float yaw = 0, target_yaw = 0, ground_y = 0;
+        if (SafeReadFloat(rec_base + kRecordYawOffset, yaw) &&
+            SafeReadFloat(rec_base + kRecordTargetYawOffset, target_yaw) &&
+            SafeReadFloat(rec_base + kRecordGroundOffset, ground_y)) {
+            ext.yaw = yaw;
+            ext.target_yaw = target_yaw;
+            ext.ground_y = ground_y;
+            ext.has_extra = 1;
+        }
+
         if (p < energy_count && energy_count <= 4) {
             float en = 0;
             if (SafeReadFloat(kEnergyTable + p * kEnergyStride, en) && en >= 0.0f && en <= 10000.0f) out.energy = en;
@@ -500,9 +531,9 @@ void CaptureHostState(HostSyncPacket& pkt) {
     }
 }
 
-// Applies authoritative Host scalar state on the Client (only called on the game thread during Present).
+// Applies authoritative Host scalar state on the Client (only called on the game thread).
 // Never modifies any guest pointer, and only updates when Client is also in an active gameplay frame.
-void ApplyHostStateOnClient(const HostSyncPacket& pkt) {
+void ApplyHostStateOnClient(const HostSyncPacket& pkt, bool new_packet) {
     if (!g_sync_enabled.load(std::memory_order_relaxed)) return;
 
     uint32_t profile = 0;
@@ -513,10 +544,12 @@ void ApplyHostStateOnClient(const HostSyncPacket& pkt) {
 
     for (uint32_t p = 0; p < 2; p++) {
         const PlayerScalarState& in = pkt.players[p];
+        const auto& ext = pkt.extra[p];
         if (!in.valid) continue;
 
         uint32_t rec_base = kPlayerRecordsBase + p * kPlayerRecordStride;
-        if (!SafeGuestRange(rec_base, 0x220)) continue;
+        if (!SafeGuestRange(rec_base, kPlayerRecordStride)) continue;
+        if (kernel::G<uint8_t>(rec_base + kRecordInactiveOffset) != 0) continue;
 
         uint32_t body_va = 0;
         if (!SafeReadU32(rec_base + kRecordBodyPtrOffset, body_va) || !body_va) {
@@ -524,17 +557,20 @@ void ApplyHostStateOnClient(const HostSyncPacket& pkt) {
         }
         if (!body_va || !SafeGuestRange(body_va, 0x380)) continue;
 
-        uint32_t cur_max_u = 0, cur_hp_u = 0;
-        if (!SafeReadU32(body_va + kBodyMaxHealthOffset, cur_max_u) ||
-            !SafeReadU32(body_va + kBodyHealthOffset, cur_hp_u))
-            continue;
-        int32_t cur_max = int32_t(cur_max_u);
-        int32_t cur_hp = int32_t(cur_hp_u);
-        // Only sync while the character body is initialized and alive on the client
-        if (cur_max <= 0 || cur_max > 100000 || cur_hp <= 0) continue;
-
-        if (in.max_health > 0 && in.max_health <= 100000) SafeWriteU32(body_va + kBodyMaxHealthOffset, uint32_t(in.max_health));
-        if (in.health > 0 && in.health <= in.max_health) SafeWriteU32(body_va + kBodyHealthOffset, uint32_t(in.health));
+        if (new_packet) {
+            uint32_t cur_max_u = 0, cur_hp_u = 0;
+            if (SafeReadU32(body_va + kBodyMaxHealthOffset, cur_max_u) &&
+                SafeReadU32(body_va + kBodyHealthOffset, cur_hp_u)) {
+                int32_t cur_max = int32_t(cur_max_u);
+                int32_t cur_hp = int32_t(cur_hp_u);
+                if (cur_max > 0 && cur_max <= 100000 && cur_hp > 0) {
+                    if (in.max_health > 0 && in.max_health <= 100000)
+                        SafeWriteU32(body_va + kBodyMaxHealthOffset, uint32_t(in.max_health));
+                    if (in.health > 0 && in.health <= in.max_health)
+                        SafeWriteU32(body_va + kBodyHealthOffset, uint32_t(in.health));
+                }
+            }
+        }
 
         float cx = 0, cy = 0, cz = 0;
         if (SafeReadFloat(rec_base + kRecordPosOffset + 0, cx) &&
@@ -544,25 +580,40 @@ void ApplyHostStateOnClient(const HostSyncPacket& pkt) {
             float dy = in.y - cy;
             float dz = in.z - cz;
             float dist_sq = dx * dx + dy * dy + dz * dz;
-            // Gentle blend for small drift (1.5..30 units), snap for larger drift (< 400 units), ignore across room loads
-            if (dist_sq > 2.25f && dist_sq < 160000.0f) {
-                float alpha = dist_sq > 900.0f ? 1.0f : 0.40f;
+            float min_dist_sq = new_packet ? 0.04f : 3600.0f;
+            // Sync across the entire arena (up to 10,000 units = dist_sq < 100,000,000):
+            // strong blend (0.75) for tiny drift on new packet, immediate snap (1.0) for drift > 25 units (dist_sq > 625)
+            if (dist_sq > min_dist_sq && dist_sq < 100000000.0f) {
+                float alpha = dist_sq > 625.0f ? 1.0f : 0.75f;
                 float nx = cx + dx * alpha;
                 float ny = cy + dy * alpha;
                 float nz = cz + dz * alpha;
                 SafeWriteFloat(rec_base + kRecordPosOffset + 0, nx);
                 SafeWriteFloat(rec_base + kRecordPosOffset + 4, ny);
                 SafeWriteFloat(rec_base + kRecordPosOffset + 8, nz);
-                SafeWriteFloat(body_va + kBodyPosOffset + 0, nx);
-                SafeWriteFloat(body_va + kBodyPosOffset + 4, ny);
-                SafeWriteFloat(body_va + kBodyPosOffset + 8, nz);
-                if (dist_sq > 16.0f) {
-                    SafeWriteFloat(rec_base + kRecordVelOffset + 0, in.vx);
-                    SafeWriteFloat(rec_base + kRecordVelOffset + 4, in.vy);
-                    SafeWriteFloat(rec_base + kRecordVelOffset + 8, in.vz);
+                SafeWriteFloat(rec_base + kRecordCachedPosOffset + 0, nx);
+                SafeWriteFloat(rec_base + kRecordCachedPosOffset + 4, ny);
+                SafeWriteFloat(rec_base + kRecordCachedPosOffset + 8, nz);
+                SafeWriteFloat(rec_base + kRecordVelOffset + 0, in.vx);
+                SafeWriteFloat(rec_base + kRecordVelOffset + 4, in.vy);
+                SafeWriteFloat(rec_base + kRecordVelOffset + 8, in.vz);
+            }
+            if (ext.has_extra && (new_packet || dist_sq > 3600.0f)) {
+                if (std::fabs(ext.ground_y) < 100000.0f) {
+                    SafeWriteFloat(rec_base + kRecordGroundOffset, ext.ground_y);
+                    if (dist_sq > 625.0f) {
+                        SafeWriteFloat(rec_base + kRecordPrevGroundOffset, ext.ground_y);
+                        SafeWriteFloat(rec_base + kRecordCurGroundOffset, ext.ground_y);
+                    }
+                }
+                if (std::fabs(ext.yaw) < 100.0f && std::fabs(ext.target_yaw) < 100.0f) {
+                    SafeWriteFloat(rec_base + kRecordYawOffset, ext.yaw);
+                    SafeWriteFloat(rec_base + kRecordTargetYawOffset, ext.target_yaw);
                 }
             }
         }
+
+        if (!new_packet) continue;
 
         if (p < energy_count && energy_count <= 4 && in.energy >= 0.0f && in.energy <= 10000.0f) {
             SafeWriteFloat(kEnergyTable + p * kEnergyStride, in.energy);
@@ -628,16 +679,19 @@ void ReceiveLoopStep() {
             std::memcpy(&pkt, buf, sizeof(pkt));
             g_remote_pad = FromWire(pkt.pad1);
             g_remote_pad.connected = true;
-        } else if (mode == kClient && hdr.type == kPktHostSync && n >= int(sizeof(HostSyncPacket))) {
+        } else if (mode == kClient && hdr.type == kPktHostSync && n >= int(offsetof(HostSyncPacket, extra))) {
             HostSyncPacket pkt{};
-            std::memcpy(&pkt, buf, sizeof(pkt));
+            std::memcpy(&pkt, buf, std::min<size_t>(size_t(n), sizeof(pkt)));
             if (pkt.hdr.seq >= g_latest_sync.hdr.seq || (g_latest_sync.hdr.seq - pkt.hdr.seq) > 10000) {
-                g_latest_sync = pkt;
-                g_has_sync = true;
                 g_host_pad0 = FromWire(pkt.pad0);
                 g_host_pad0.connected = true;
                 g_host_pad1 = FromWire(pkt.pad1);
                 g_host_pad1.connected = true;
+                if (pkt.players[0].valid || pkt.players[1].valid) {
+                    g_latest_sync = pkt;
+                    g_has_sync = true;
+                    g_last_sync_ms = now;
+                }
             }
         }
     }
@@ -714,7 +768,7 @@ void NetplayThreadLoop() {
             bool send_now = false;
             {
                 std::lock_guard lock(g_lock);
-                if (now - g_last_host_send_ms >= 12) {
+                if (now - g_last_host_send_ms >= 25) {
                     g_last_host_send_ms = now;
                     pkt = g_host_cached_sync;
                     pkt.hdr.type = kPktHostSync;
@@ -727,10 +781,9 @@ void NetplayThreadLoop() {
                     pkt.pad0.connected = 1;
                     pkt.pad1 = ToWire(g_remote_pad);
                     pkt.pad1.connected = 1;
-                    if (now - g_last_host_frame_ms > 100) {
-                        pkt.players[0].valid = 0;
-                        pkt.players[1].valid = 0;
-                    }
+                    // Keepalive packet from background thread: do not overwrite Client positions with stale cache
+                    pkt.players[0].valid = 0;
+                    pkt.players[1].valid = 0;
                     send_now = true;
                 }
             }
@@ -845,11 +898,44 @@ void FilterPad(int port, input::Pad& pad) {
     uint32_t mode = GetMode();
     if (mode == kOff) return;
 
+    if (port == 0) {
+        ReceiveLoopStep();
+    }
+
     if (mode == kHost) {
         if (port == 0) {
             pad.connected = true;
-            std::lock_guard lock(g_lock);
-            g_local_pad = pad;
+            uint32_t peer_ip = 0;
+            uint16_t peer_port = 0;
+            uint32_t now = TickMs();
+            HostSyncPacket pkt{};
+            pkt.hdr.type = kPktHostSync;
+            pkt.hdr.role = kHost;
+            pkt.hdr.flags = g_sync_enabled.load(std::memory_order_relaxed) ? 1 : 0;
+            pkt.hdr.send_ms = now;
+            CaptureHostState(pkt);
+            {
+                std::lock_guard lock(g_lock);
+                g_local_pad = pad;
+                peer_ip = g_peer_ip;
+                peer_port = g_peer_port;
+                pkt.hdr.seq = ++g_tx_seq;
+                pkt.hdr.echo_ms = g_last_echo_ms;
+                pkt.pad0 = ToWire(g_local_pad);
+                pkt.pad0.connected = 1;
+                pkt.pad1 = ToWire(g_remote_pad);
+                pkt.pad1.connected = 1;
+                g_host_cached_sync = pkt;
+                g_last_host_frame_ms = now;
+                if (now - g_last_host_send_ms >= 8) {
+                    g_last_host_send_ms = now;
+                } else {
+                    peer_ip = 0;
+                }
+            }
+            if (peer_ip) {
+                SendUdp(&pkt, sizeof(pkt), peer_ip, peer_port);
+            }
         } else if (port == 1) {
             std::lock_guard lock(g_lock);
             if (g_connected.load(std::memory_order_relaxed)) {
@@ -862,12 +948,26 @@ void FilterPad(int port, input::Pad& pad) {
         if (port == 0) {
             // On Android, local Touch Controls / Gamepad / Keyboard arrive on port 0.
             // Save them as Client's Player 2 input, then substitute Host's Player 1 input on port 0!
-            std::lock_guard lock(g_lock);
-            pad.connected = true;
-            g_local_pad = pad;
-            if (g_connected.load(std::memory_order_relaxed)) {
-                pad = g_host_pad0;
+            HostSyncPacket sync{};
+            bool apply = false;
+            bool new_packet = false;
+            {
+                std::lock_guard lock(g_lock);
                 pad.connected = true;
+                g_local_pad = pad;
+                if (g_connected.load(std::memory_order_relaxed)) {
+                    pad = g_host_pad0;
+                    pad.connected = true;
+                    if (g_has_sync && (g_latest_sync.hdr.seq != g_last_applied_seq || (TickMs() - g_last_sync_ms) < 150)) {
+                        sync = g_latest_sync;
+                        new_packet = (sync.hdr.seq != g_last_applied_seq);
+                        g_last_applied_seq = sync.hdr.seq;
+                        apply = true;
+                    }
+                }
+            }
+            if (apply) {
+                ApplyHostStateOnClient(sync, new_packet);
             }
         } else if (port == 1) {
             std::lock_guard lock(g_lock);
@@ -933,7 +1033,7 @@ void OnFrame() {
             }
         }
         if (apply) {
-            ApplyHostStateOnClient(sync);
+            ApplyHostStateOnClient(sync, true);
         }
     }
 }

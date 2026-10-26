@@ -7,6 +7,7 @@
 #include "common/netplay.h"
 #include "common/options.h"
 #include "common/pad_binds.h"
+#include "kernel/kernel.h"
 
 namespace game {
 
@@ -23,6 +24,16 @@ void Pad(int port, input::Pad& pad) {
     }
     if (port == 0) input::Keyboard(pad);
     netplay::FilterPad(port, pad);
+    if (kernel::R32(0x58A610) != 0 || kernel::G<uint8_t>(0x58A614) != 0 || kernel::R32(0x58A618) != 0 ||
+        kernel::R32(0x58E4B4) != 0 || kernel::G<uint8_t>(0x58E4B0) != 0 || kernel::G<uint8_t>(0x59D320) != 0) {
+        kernel::W32(0x5CAB98, 0);
+    }
+    // Inside the Fatality combo input loop (0x03F020), pressing WHITE (L2, analog[5]) a second time at 0x03EDF0
+    // immediately cancels the Fatality outside tutorial mode. Since L2 is never part of any Fatality button
+    // combo, suppress analog[5] while the Fatality input window is active so touch/trigger double-taps never abort it.
+    if (kernel::G<uint8_t>(0x58A614) != 0 || kernel::R32(0x58A610) == 1) {
+        pad.analog[5] = 0;
+    }
 }
 
 // no vibration while the keyboard and mouse are in use

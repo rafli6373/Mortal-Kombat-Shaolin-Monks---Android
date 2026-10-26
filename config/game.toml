@@ -317,6 +317,12 @@ XPP_MemoryUnitType          = 0
 at = 0x0CB800
 call = "FrameSkip"
 
+# fatality synchronous loops (0x03F020, 0x03E970, 0x03EAF0, 0x03E900) call 0x1B0AF0 directly without updating 0x5CAB98:
+# never skip drawing inside 0x1B0AF0 while a fatality or fatality tutorial is active
+[[hook]]
+at = 0x1B0B24
+call = "KeepFatalityDraw"
+
 # a camera's update (0x124150) has the aspect for D3DXMatrixPerspectiveFovLH in eax: the screen's 4:3 is
 # widened to the shown frame's, for a wider view instead of a stretched one
 [[hook]]

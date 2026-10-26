@@ -38,6 +38,19 @@ uint32_t ConsoleLanguage() {
 // which gameplay's frame (0x0CB780) decides each frame, every sixth there. Frames behind the clock are skipped the
 // same way, so the world keeps its speed and the frame rate drops instead. With FRAME SKIP off the game's own
 // choice stands: slow motion under 60, as the console had it.
+namespace {
+
+// Fatalities and the Fatality tutorial run synchronous loops (0x03F020, 0x03E970, 0x03EAF0, 0x03E900) that call
+// 0x1B0AF0 directly without returning to 0x0CB780. If kSkipDraw (0x5CAB98) is 1 on entry, 0x1B0AF0 skips rendering
+// and Present() on every iteration, either burning through the 200-tick input window in <1 ms (instant auto-cancel)
+// or freezing indefinitely during the first Fatality tutorial (0x58A618 != 0).
+bool FatalityBusy() {
+    return kernel::R32(0x58A610) != 0 || kernel::G<uint8_t>(0x58A614) != 0 || kernel::R32(0x58A618) != 0 ||
+           kernel::R32(0x58E4B4) != 0 || kernel::G<uint8_t>(0x58E4B0) != 0 || kernel::G<uint8_t>(0x59D320) != 0;
+}
+
+}  // namespace
+
 void FrameSkip(X86Context&, uint8_t*) {
     using clock = std::chrono::steady_clock;
     constexpr uint32_t kSkipDraw = 0x5CAB98;
@@ -48,6 +61,12 @@ void FrameSkip(X86Context&, uint8_t*) {
     static clock::time_point due;
     static int skips = 0;
     auto now = clock::now();
+    if (FatalityBusy()) {
+        kernel::W32(kSkipDraw, 0);
+        due = now;
+        skips = 0;
+        return;
+    }
     if (!game::Opt().frame_skip) {
         due = now;  // turned on again, it starts from here
         skips = 0;
@@ -64,6 +83,10 @@ void FrameSkip(X86Context&, uint8_t*) {
 // (0x1245DC), and 1.2 for gameplay's. Wider settings stretched it. A camera of about 4:3 gets the shown frame's
 // aspect instead, the same height of view and more of the sides; render to texture cameras of other shapes keep
 // theirs.
+void KeepFatalityDraw(X86Context&, uint8_t*) {
+    if (FatalityBusy()) kernel::W32(0x5CAB98, 0);
+}
+
 void WidenAspect(X86Context& ctx, uint8_t*) {
     if (!game::Ultrawide()) return;
     float aspect;
