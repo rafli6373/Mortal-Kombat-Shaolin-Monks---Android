@@ -97,6 +97,18 @@ struct ClientPadPacket {
     WirePad pad1;
 };
 
+constexpr uint32_t kEnemySlots = 12;  // character slots p = 2..13 at 0x5D1AB8 + p * 0x3238
+
+struct EnemyScalarState {
+    uint8_t active = 0;      // 1 if slot occupied on Host, 0 if empty/despawned
+    int16_t entity_id = -1;  // [rec_base + 0x1DFE]
+    int32_t health = 0;      // [body_va + 0x368] (<= 0 when dying/dead)
+    int32_t max_health = 0;  // [body_va + 0x370]
+    float x = 0, y = 0, z = 0;
+    float yaw = 0;
+    float ground_y = 0;
+};
+
 struct HostSyncPacket {
     PacketHeader hdr;
     WirePad pad0;
@@ -109,6 +121,8 @@ struct HostSyncPacket {
         float ground_y = 0;
         uint8_t has_extra = 0;
     } extra[2];
+    uint8_t has_enemies = 0;
+    EnemyScalarState enemies[kEnemySlots];
 };
 #pragma pack(pop)
 
@@ -197,16 +211,23 @@ constexpr uint32_t kFatalityLevelOffset = 0x38;
 
 constexpr uint32_t kPlayerRecordsBase = 0x5D1AB8;
 constexpr uint32_t kPlayerRecordStride = 0x3238;
-constexpr uint32_t kRecordInactiveOffset = 0x70;   // uint8_t: 0 when active in gameplay
-constexpr uint32_t kRecordPosOffset = 0x80;        // float x, y, z
-constexpr uint32_t kRecordYawOffset = 0x94;        // float yaw (radians)
-constexpr uint32_t kRecordPrevGroundOffset = 0xC0; // float prev_ground_y
-constexpr uint32_t kRecordCurGroundOffset = 0xC4;  // float cur_ground_y
-constexpr uint32_t kRecordVelOffset = 0xD0;        // float vx, vy, vz
-constexpr uint32_t kRecordGroundOffset = 0xF4;     // float ground_y
-constexpr uint32_t kRecordBodyPtrOffset = 0x200;   // 0x5D1CB8: pointer to player Body
-constexpr uint32_t kRecordTargetYawOffset = 0x3120;// float target_yaw (radians)
-constexpr uint32_t kRecordCachedPosOffset = 0x3164;// float cached_x, cached_y, cached_z
+constexpr uint32_t kRecordInactiveOffset = 0x70;      // uint8_t: 0 when active in gameplay
+constexpr uint32_t kRecordPosOffset = 0x80;           // float x, y, z
+constexpr uint32_t kRecordYawOffset = 0x94;           // float yaw (radians)
+constexpr uint32_t kRecordPrevGroundOffset = 0xC0;    // float prev_ground_y
+constexpr uint32_t kRecordCurGroundOffset = 0xC4;     // float cur_ground_y
+constexpr uint32_t kRecordVelOffset = 0xD0;           // float vx, vy, vz
+constexpr uint32_t kRecordRenderPosOffset = 0xE0;     // float render_x, render_y, render_z (0x1C6AE0 / 0x199C00)
+constexpr uint32_t kRecordGroundOffset = 0xF4;        // float ground_y
+constexpr uint32_t kRecordBodyPtrOffset = 0x200;      // 0x5D1CB8: pointer to character Body
+constexpr uint32_t kRecordEntityIdOffset = 0x1DFE;    // int16_t: entity type/slot ID (-1 when empty)
+constexpr uint32_t kRecordActionStateOffset = 0x1E04; // int32_t: action state (6 when dying/dead)
+constexpr uint32_t kRecordDeathTimerOffset = 0x2648;  // int32_t: corpse despawn timer checked by 0x176F10
+constexpr uint32_t kRecordInterpTimerOffset = 0x2BC4; // uint32_t: knockback/grab lerp timer (+0x2BC4) & duration (+0x2BC6)
+constexpr uint32_t kRecordInterpTargetOffset = 0x2BD8;// float target_x, target_y, target_z (0x0D6000)
+constexpr uint32_t kRecordTargetYawOffset = 0x3120;   // float target_yaw (radians)
+constexpr uint32_t kRecordCachedPosOffset = 0x3164;   // float cached_x, cached_y, cached_z
+constexpr uint32_t kDespawnTimerLimitAddr = 0x510B70; // int32_t: despawn timer threshold in 0x176F10
 
 constexpr uint32_t kPlayerObjectsTable[2] = {0x51005C, 0x510060};
 constexpr uint32_t kBodyCountAddr = 0x5142A4;
@@ -529,7 +550,46 @@ void CaptureHostState(HostSyncPacket& pkt) {
             }
         }
     }
+
+    // Capture all 12 enemy slots (p = 2..13 at 0x5D1AB8 + p * 0x3238) so enemy positions, health, and deaths stay in sync
+    pkt.has_enemies = 1;
+    for (uint32_t e = 0; e < kEnemySlots; e++) {
+        EnemyScalarState& es = pkt.enemies[e];
+        es = EnemyScalarState{};
+        uint32_t rec_base = kPlayerRecordsBase + (e + 2) * kPlayerRecordStride;
+        if (!SafeGuestRange(rec_base, kPlayerRecordStride)) continue;
+        uint8_t inactive = kernel::G<uint8_t>(rec_base + kRecordInactiveOffset);
+        int16_t ent_id = kernel::G<int16_t>(rec_base + kRecordEntityIdOffset);
+        if (inactive != 0 || ent_id < 0) continue;
+
+        uint32_t body_va = 0;
+        if (!SafeReadU32(rec_base + kRecordBodyPtrOffset, body_va) || !body_va || !SafeGuestRange(body_va, 0x380)) continue;
+
+        uint32_t hp_u = 0, max_hp_u = 0;
+        if (!SafeReadU32(body_va + kBodyHealthOffset, hp_u) || !SafeReadU32(body_va + kBodyMaxHealthOffset, max_hp_u)) continue;
+        int32_t mh = int32_t(max_hp_u);
+        if (mh <= 0 || mh > 100000) continue;
+
+        float x = 0, y = 0, z = 0;
+        if (!SafeReadFloat(rec_base + kRecordPosOffset + 0, x) ||
+            !SafeReadFloat(rec_base + kRecordPosOffset + 4, y) ||
+            !SafeReadFloat(rec_base + kRecordPosOffset + 8, z))
+            continue;
+        if (std::fabs(x) > 100000.0f || std::fabs(y) > 100000.0f || std::fabs(z) > 100000.0f) continue;
+
+        es.active = 1;
+        es.entity_id = ent_id;
+        es.health = int32_t(hp_u);
+        es.max_health = mh;
+        es.x = x;
+        es.y = y;
+        es.z = z;
+        SafeReadFloat(rec_base + kRecordYawOffset, es.yaw);
+        SafeReadFloat(rec_base + kRecordGroundOffset, es.ground_y);
+    }
 }
+
+uint8_t g_enemy_missing_ticks[kEnemySlots] = {};
 
 // Applies authoritative Host scalar state on the Client (only called on the game thread).
 // Never modifies any guest pointer, and only updates when Client is also in an active gameplay frame.
@@ -580,10 +640,9 @@ void ApplyHostStateOnClient(const HostSyncPacket& pkt, bool new_packet) {
             float dy = in.y - cy;
             float dz = in.z - cz;
             float dist_sq = dx * dx + dy * dy + dz * dz;
-            float min_dist_sq = new_packet ? 0.04f : 3600.0f;
             // Sync across the entire arena (up to 10,000 units = dist_sq < 100,000,000):
-            // strong blend (0.75) for tiny drift on new packet, immediate snap (1.0) for drift > 25 units (dist_sq > 625)
-            if (dist_sq > min_dist_sq && dist_sq < 100000000.0f) {
+            // strong blend (0.75) for tiny drift, immediate snap (1.0) for drift > 25 units (dist_sq > 625)
+            if (dist_sq > 0.04f && dist_sq < 100000000.0f) {
                 float alpha = dist_sq > 625.0f ? 1.0f : 0.75f;
                 float nx = cx + dx * alpha;
                 float ny = cy + dy * alpha;
@@ -591,14 +650,24 @@ void ApplyHostStateOnClient(const HostSyncPacket& pkt, bool new_packet) {
                 SafeWriteFloat(rec_base + kRecordPosOffset + 0, nx);
                 SafeWriteFloat(rec_base + kRecordPosOffset + 4, ny);
                 SafeWriteFloat(rec_base + kRecordPosOffset + 8, nz);
+                SafeWriteFloat(rec_base + kRecordRenderPosOffset + 0, nx);
+                SafeWriteFloat(rec_base + kRecordRenderPosOffset + 4, ny);
+                SafeWriteFloat(rec_base + kRecordRenderPosOffset + 8, nz);
                 SafeWriteFloat(rec_base + kRecordCachedPosOffset + 0, nx);
                 SafeWriteFloat(rec_base + kRecordCachedPosOffset + 4, ny);
                 SafeWriteFloat(rec_base + kRecordCachedPosOffset + 8, nz);
                 SafeWriteFloat(rec_base + kRecordVelOffset + 0, in.vx);
                 SafeWriteFloat(rec_base + kRecordVelOffset + 4, in.vy);
                 SafeWriteFloat(rec_base + kRecordVelOffset + 8, in.vz);
+                if (dist_sq > 625.0f) {
+                    // Cancel any local-only knockback/grab interpolation (0x0D6000) that would pull the player back
+                    SafeWriteU32(rec_base + kRecordInterpTimerOffset, 0);
+                    SafeWriteFloat(rec_base + kRecordInterpTargetOffset + 0, nx);
+                    SafeWriteFloat(rec_base + kRecordInterpTargetOffset + 4, ny);
+                    SafeWriteFloat(rec_base + kRecordInterpTargetOffset + 8, nz);
+                }
             }
-            if (ext.has_extra && (new_packet || dist_sq > 3600.0f)) {
+            if (ext.has_extra) {
                 if (std::fabs(ext.ground_y) < 100000.0f) {
                     SafeWriteFloat(rec_base + kRecordGroundOffset, ext.ground_y);
                     if (dist_sq > 625.0f) {
@@ -628,11 +697,107 @@ void ApplyHostStateOnClient(const HostSyncPacket& pkt, bool new_packet) {
             }
         }
     }
+
+    // Apply authoritative Host enemy state for slots p = 2..13
+    if (pkt.has_enemies) {
+        for (uint32_t e = 0; e < kEnemySlots; e++) {
+            const EnemyScalarState& es = pkt.enemies[e];
+            uint32_t rec_base = kPlayerRecordsBase + (e + 2) * kPlayerRecordStride;
+            if (!SafeGuestRange(rec_base, kPlayerRecordStride)) continue;
+
+            uint8_t c_inactive = kernel::G<uint8_t>(rec_base + kRecordInactiveOffset);
+            int16_t c_ent_id = kernel::G<int16_t>(rec_base + kRecordEntityIdOffset);
+            if (c_inactive != 0 || c_ent_id < 0) {
+                g_enemy_missing_ticks[e] = 0;
+                continue;
+            }
+
+            uint32_t body_va = 0;
+            if (!SafeReadU32(rec_base + kRecordBodyPtrOffset, body_va) || !body_va || !SafeGuestRange(body_va, 0x380)) continue;
+
+            uint32_t c_hp_u = 0, c_max_u = 0;
+            if (!SafeReadU32(body_va + kBodyHealthOffset, c_hp_u) || !SafeReadU32(body_va + kBodyMaxHealthOffset, c_max_u)) continue;
+            int32_t c_hp = int32_t(c_hp_u);
+            int32_t c_max = int32_t(c_max_u);
+            if (c_max <= 0 || c_max > 100000) continue;
+
+            if (es.active && es.health > 0) {
+                g_enemy_missing_ticks[e] = 0;
+                if (new_packet && c_hp > 0) {
+                    if (es.max_health > 0 && es.max_health <= 100000)
+                        SafeWriteU32(body_va + kBodyMaxHealthOffset, uint32_t(es.max_health));
+                    if (es.health <= es.max_health)
+                        SafeWriteU32(body_va + kBodyHealthOffset, uint32_t(es.health));
+                }
+                float cx = 0, cy = 0, cz = 0;
+                if (SafeReadFloat(rec_base + kRecordPosOffset + 0, cx) &&
+                    SafeReadFloat(rec_base + kRecordPosOffset + 4, cy) &&
+                    SafeReadFloat(rec_base + kRecordPosOffset + 8, cz)) {
+                    float dx = es.x - cx;
+                    float dy = es.y - cy;
+                    float dz = es.z - cz;
+                    float dist_sq = dx * dx + dy * dy + dz * dz;
+                    if (dist_sq > 0.04f && dist_sq < 100000000.0f) {
+                        float alpha = dist_sq > 400.0f ? 1.0f : 0.80f;
+                        float nx = cx + dx * alpha;
+                        float ny = cy + dy * alpha;
+                        float nz = cz + dz * alpha;
+                        SafeWriteFloat(rec_base + kRecordPosOffset + 0, nx);
+                        SafeWriteFloat(rec_base + kRecordPosOffset + 4, ny);
+                        SafeWriteFloat(rec_base + kRecordPosOffset + 8, nz);
+                        SafeWriteFloat(rec_base + kRecordRenderPosOffset + 0, nx);
+                        SafeWriteFloat(rec_base + kRecordRenderPosOffset + 4, ny);
+                        SafeWriteFloat(rec_base + kRecordRenderPosOffset + 8, nz);
+                        SafeWriteFloat(rec_base + kRecordCachedPosOffset + 0, nx);
+                        SafeWriteFloat(rec_base + kRecordCachedPosOffset + 4, ny);
+                        SafeWriteFloat(rec_base + kRecordCachedPosOffset + 8, nz);
+                        if (dist_sq > 400.0f) {
+                            SafeWriteU32(rec_base + kRecordInterpTimerOffset, 0);
+                            SafeWriteFloat(rec_base + kRecordInterpTargetOffset + 0, nx);
+                            SafeWriteFloat(rec_base + kRecordInterpTargetOffset + 4, ny);
+                            SafeWriteFloat(rec_base + kRecordInterpTargetOffset + 8, nz);
+                        }
+                    }
+                    if (std::fabs(es.ground_y) < 100000.0f) {
+                        SafeWriteFloat(rec_base + kRecordGroundOffset, es.ground_y);
+                        if (dist_sq > 400.0f) {
+                            SafeWriteFloat(rec_base + kRecordPrevGroundOffset, es.ground_y);
+                            SafeWriteFloat(rec_base + kRecordCurGroundOffset, es.ground_y);
+                        }
+                    }
+                    if (std::fabs(es.yaw) < 100.0f) {
+                        SafeWriteFloat(rec_base + kRecordYawOffset, es.yaw);
+                        SafeWriteFloat(rec_base + kRecordTargetYawOffset, es.yaw);
+                    }
+                }
+            } else if (es.active && es.health <= 0) {
+                // Enemy is dying / dead on Host: mark dead on Client and start despawn timer (0x176F10)
+                if (c_hp > 0) {
+                    SafeWriteU32(body_va + kBodyHealthOffset, 0xFFFFFFFFu);
+                    SafeWriteU32(rec_base + kRecordActionStateOffset, 6);
+                    int32_t cur_timer = int32_t(kernel::R32(rec_base + kRecordDeathTimerOffset));
+                    if (cur_timer < 0) SafeWriteU32(rec_base + kRecordDeathTimerOffset, 0);
+                }
+            } else if (!es.active && new_packet) {
+                // Slot is empty/despawned on Host while still occupied on Client: trigger clean despawn via 0x176F10 -> 0x16C6D0
+                if (g_enemy_missing_ticks[e] < 255) g_enemy_missing_ticks[e]++;
+                if (g_enemy_missing_ticks[e] >= 12) {
+                    SafeWriteU32(body_va + kBodyHealthOffset, 0xFFFFFFFFu);
+                    SafeWriteU32(rec_base + kRecordActionStateOffset, 6);
+                    uint32_t limit = 60;
+                    SafeReadU32(kDespawnTimerLimitAddr, limit);
+                    if (limit > 10000) limit = 60;
+                    SafeWriteU32(rec_base + kRecordDeathTimerOffset, limit + 1);
+                    g_enemy_missing_ticks[e] = 0;
+                }
+            }
+        }
+    }
 }
 
 void ReceiveLoopStep() {
     if (g_sock == kBadSocket) return;
-    uint8_t buf[512];
+    uint8_t buf[1024];
     for (int iter = 0; iter < 32; iter++) {
         sockaddr_in from{};
         socklen_t from_len = sizeof(from);
@@ -784,6 +949,7 @@ void NetplayThreadLoop() {
                     // Keepalive packet from background thread: do not overwrite Client positions with stale cache
                     pkt.players[0].valid = 0;
                     pkt.players[1].valid = 0;
+                    pkt.has_enemies = 0;
                     send_now = true;
                 }
             }
@@ -995,6 +1161,7 @@ void OnFrame() {
     ReceiveLoopStep();
 
     if (mode == kHost) {
+        static uint32_t last_tx_sim = 0;
         uint32_t peer_ip = 0;
         uint16_t peer_port = 0;
         uint32_t now = TickMs();
@@ -1016,7 +1183,12 @@ void OnFrame() {
             pkt.pad1.connected = 1;
             g_host_cached_sync = pkt;
             g_last_host_frame_ms = now;
-            g_last_host_send_ms = now;
+            if ((pkt.hdr.sim_frame && pkt.hdr.sim_frame != last_tx_sim) || (now - g_last_host_send_ms >= 6)) {
+                last_tx_sim = pkt.hdr.sim_frame;
+                g_last_host_send_ms = now;
+            } else {
+                peer_ip = 0;
+            }
         }
         if (peer_ip) {
             SendUdp(&pkt, sizeof(pkt), peer_ip, peer_port);
@@ -1024,16 +1196,19 @@ void OnFrame() {
     } else if (mode == kClient) {
         HostSyncPacket sync{};
         bool apply = false;
+        bool new_packet = false;
         {
             std::lock_guard lock(g_lock);
-            if (g_connected.load(std::memory_order_relaxed) && g_has_sync && g_latest_sync.hdr.seq != g_last_applied_seq) {
+            if (g_connected.load(std::memory_order_relaxed) && g_has_sync &&
+                (g_latest_sync.hdr.seq != g_last_applied_seq || (TickMs() - g_last_sync_ms) < 150)) {
                 sync = g_latest_sync;
+                new_packet = (sync.hdr.seq != g_last_applied_seq);
                 g_last_applied_seq = sync.hdr.seq;
                 apply = true;
             }
         }
         if (apply) {
-            ApplyHostStateOnClient(sync, true);
+            ApplyHostStateOnClient(sync, new_packet);
         }
     }
 }
